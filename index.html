@@ -1,0 +1,62 @@
+<!doctype html>
+<!-- Aurora 렌더러의 HTML 뼈대 -->
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: file: blob:; media-src 'self' file: blob:; worker-src 'self' blob:"
+    />
+    <title>Aurora</title>
+    <link rel="icon" type="image/png" href="./favicon.png" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+  </head>
+  <body>
+    <div id="tabbar"></div>
+    <div id="compare-bar" hidden>
+      <span id="compare-title"></span>
+      <button data-cmd="compare:prev">◀ 이전</button>
+      <button data-cmd="compare:next">다음 ▶</button>
+      <label><input type="checkbox" id="opt-whitespace" checked /> 공백 무시</label>
+      <label><input type="checkbox" id="opt-case" /> 대소문자 무시</label>
+      <span id="compare-count"></span>
+      <button data-cmd="compare:close">닫기</button>
+    </div>
+    <div id="workspace">
+      <aside id="sidebar" hidden>
+        <div class="side-head">
+          <strong>업무 노트</strong>
+          <button data-cmd="notes:today">오늘</button>
+        </div>
+        <div class="cal-nav">
+          <button id="cal-prev" title="이전 달">◀</button>
+          <span id="cal-title"></span>
+          <button id="cal-next" title="다음 달">▶</button>
+        </div>
+        <div id="calendar"></div>
+        <div class="side-tabs">
+          <button data-panel="notes" class="active">노트</button>
+          <button data-panel="backlinks">백링크</button>
+          <button data-panel="tags">태그</button>
+          <button data-panel="tasks">할 일</button>
+        </div>
+        <div id="side-panel"></div>
+        <div id="notes-dir" title="노트 폴더"></div>
+      </aside>
+      <div id="editor-host"></div>
+      <div id="diff-host" hidden></div>
+      <div id="graph-host" hidden>
+        <div id="graph-bar">
+          <span id="graph-title">그래프</span>
+          <label><input type="checkbox" id="graph-local" /> 현재 노트 주변만</label>
+          <label><input type="checkbox" id="graph-tags" /> 태그 보기</label>
+          <button data-cmd="notes:graph">닫기</button>
+        </div>
+        <canvas id="graph-canvas"></canvas>
+      </div>
+      <div id="preview" class="markdown" hidden></div>
+    </div>
+    <div id="statusbar"><span id="status-msg"></span><span id="status-pos"></span></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,73 @@
+{
+  "name": "aurora",
+  "productName": "Aurora",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Notepad++와 Beyond Compare를 대신하는 개인용 텍스트 편집·비교·노트 도구",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "vite",
+    "build:web": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && tsc -p tsconfig.electron.json && vite build",
+    "dist": "npm run build && electron-builder --mac",
+    "dist:win": "npm run build && electron-builder --win",
+    "test": "vitest run"
+  },
+  "build": {
+    "appId": "com.byniq.aurora",
+    "productName": "Aurora",
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "fileAssociations": [
+      {
+        "ext": ["md", "markdown"],
+        "name": "Markdown",
+        "description": "Markdown 문서",
+        "role": "Editor",
+        "rank": "Alternate"
+      }
+    ],
+    "mac": {
+      "target": [
+        "dmg",
+        "dir"
+      ],
+      "category": "public.app-category.developer-tools",
+      "identity": null
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64", "arm64"]
+        },
+        {
+          "target": "zip",
+          "arch": ["x64", "arm64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "devDependencies": {
+    "electron": "44.7.2",
+    "electron-builder": "26.15.3",
+    "monaco-editor": "0.57.0",
+    "typescript": "5.9.3",
+    "vite": "7.3.7",
+    "vitest": "4.1.12"
+  },
+  "dependencies": {
+    "marked": "18.1.1"
+  }
+}
