@@ -2,10 +2,16 @@
 import {
   app, BrowserWindow, Menu, dialog, ipcMain, clipboard, nativeTheme, shell, systemPreferences, type MenuItemConstructorOptions,
 } from 'electron';
-import { readFile, writeFile, mkdir, readdir, stat, copyFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, readdir, stat, copyFile, rename } from 'node:fs/promises';
 import { statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { registerAiHandlers } from './aiHost';
+import { registerCloudHandlers } from './cloudHost';
 import { COMMANDS, commandForInput, resolveBindings, type KeyOverrides } from './keybindings';
+import { isSkippedEntry, isTextPath, shouldKeepContent, shouldReadFile } from './fileTypes';
+import { createSerialQueue } from './serialQueue';
+import { createExclusive, writeTextChecked } from './fileWrites';
 
 // 노트 폴더 같은 앱 설정을 저장하는 파일
 const configPath = () => path.join(app.getPath('userData'), 'config.json');
@@ -30,13 +36,33 @@ async function migrateOldConfig() {
   }
 }
 
-async function readConfig(): Promise<{ notesDir?: string; keybindings?: KeyOverrides }> {
+type AppConfig = { notesDir?: string; keybindings?: KeyOverrides; ai?: unknown; storage?: unknown };
+
+async function readConfig(): Promise<AppConfig> {
   try {
     return JSON.parse(await readFile(configPath(), 'utf8'));
   } catch {
     return {};
   }
 }
+
+const configWrites = createSerialQueue();
+
+/** 설정 파일을 읽고 합쳐 임시 파일에 쓴 뒤 이름을 바꾼다. 겹쳐 쓰다 값을 잃지 않게 한 줄로 세운다 */
+function patchConfig(patch: Partial<AppConfig>): Promise<void> {
+  return configWrites.run(async () => {
+    const next = JSON.stringify({ ...(await readConfig()), ...patch }, null, 2);
+    const tmp = path.join(path.dirname(configPath()), `config.${randomUUID()}.tmp`);
+    await writeFile(tmp, next);
+    await rename(tmp, configPath());
+  });
+}
+
+// 화면의 파일 쓰기와 클라우드에서 받은 파일 갈아 끼우기를 한 줄로 세워, 저장과 내려받기가 서로 덮지 않게 한다
+const fileWrites = createSerialQueue();
+
+registerAiHandlers({ readConfig, patchConfig });
+const cloud = registerCloudHandlers({ readConfig, patchConfig, writeQueue: fileWrites });
 
 let win: BrowserWindow | null = null;
 // 단축키 설정 창에서 키를 기다리는 중이면 true. 이때는 메뉴 단축키 대신 렌더러로 키를 넘긴다
@@ -281,6 +307,10 @@ function buildMenu(bindings: Record<string, string>) {
         sep,
         item('notes:choose-dir'),
         item('notes:folders'),
+        item('notes:storage'),
+        sep,
+        item('notes:ai-chat'),
+        item('notes:ai-settings'),
       ],
     },
     { role: 'windowMenu' },
@@ -300,12 +330,18 @@ ipcMain.handle('file:read', async (_e, filePath: string) => readFile(filePath, '
 
 // 첨부: 붙여 넣은 이미지 바이트를 쓰거나, 끌어다 놓은 파일을 복사한다. 폴더가 없으면 만든다
 ipcMain.handle('file:write-binary', async (_e, filePath: string, data: Uint8Array) => {
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, data);
+  await fileWrites.run(async () => {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, data);
+  });
+  cloud.noteWritten(filePath);
 });
 ipcMain.handle('file:copy', async (_e, from: string, to: string) => {
-  await mkdir(path.dirname(to), { recursive: true });
-  await copyFile(from, to);
+  await fileWrites.run(async () => {
+    await mkdir(path.dirname(to), { recursive: true });
+    await copyFile(from, to);
+  });
+  cloud.noteWritten(to);
 });
 ipcMain.handle('file:exists', async (_e, filePath: string) => {
   try {
@@ -318,10 +354,18 @@ ipcMain.handle('file:exists', async (_e, filePath: string) => {
 // 첨부 파일을 운영체제 기본 앱으로 연다
 ipcMain.handle('shell:open-path', (_e, filePath: string) => shell.openPath(filePath));
 
-ipcMain.handle('file:write', async (_e, filePath: string, content: string) => {
-  // [[링크]]로 하위 폴더에 새 노트를 만들 때를 위해 폴더도 만든다
-  await mkdir(path.dirname(filePath), { recursive: true });
-  await writeFile(filePath, content, 'utf8');
+// expectedHash를 주면 디스크 내용이 그 해시와 다를 때(다른 기기에서 받은 변경 등) 쓰지 않고 conflict를 돌려준다
+ipcMain.handle('file:write', async (_e, filePath: string, content: string, expectedHash?: string) => {
+  const res = await fileWrites.run(() => writeTextChecked(filePath, content, expectedHash));
+  if (res.ok) cloud.noteWritten(filePath);
+  return res;
+});
+
+// 새 노트·파일 만들기. 그사이 다른 기기에서 받은 같은 이름의 파일이 있으면 덮지 않고 false를 돌려준다
+ipcMain.handle('file:create', async (_e, filePath: string, content: string) => {
+  const created = await fileWrites.run(() => createExclusive(filePath, content));
+  if (created) cloud.noteWritten(filePath);
+  return created;
 });
 
 ipcMain.handle('file:save-dialog', async (_e, defaultName: string) => {
@@ -358,7 +402,8 @@ ipcMain.handle('notes:choose-dir', async () => {
   });
   if (res.canceled) return null;
   const notesDir = res.filePaths[0];
-  await writeFile(configPath(), JSON.stringify({ ...(await readConfig()), notesDir }, null, 2));
+  await patchConfig({ notesDir });
+  await cloud.notesDirChanged();
   return notesDir;
 });
 
@@ -372,16 +417,19 @@ ipcMain.handle('notes:list', async (_e, notesDir: string, folder: string) => {
     .sort();
 });
 
-// 노트 폴더 아래 모든 .md 파일을 읽는다. .obsidian·.git 같은 숨김 폴더와 node_modules는 건너뛴다
+// 노트 폴더 아래 .md와 txt·html 같은 텍스트 파일을 읽는다. .obsidian·.git 같은 숨김 폴더와 node_modules는 건너뛴다
 ipcMain.handle('vault:scan', async (_e, notesDir: string) => {
   const out: { path: string; mtime: number; content: string }[] = [];
   const walk = async (dir: string) => {
     for (const ent of await readdir(dir, { withFileTypes: true })) {
-      if (ent.name.startsWith('.') || ent.name === 'node_modules') continue;
+      if (isSkippedEntry(ent.name)) continue;
       const full = path.join(dir, ent.name);
       if (ent.isDirectory()) await walk(full);
-      else if (ent.isFile() && ent.name.toLowerCase().endsWith('.md')) {
-        const [content, st] = await Promise.all([readFile(full, 'utf8'), stat(full)]);
+      else if (ent.isFile() && isTextPath(ent.name)) {
+        const st = await stat(full);
+        if (!shouldReadFile(ent.name, st.size)) continue;
+        const content = await readFile(full, 'utf8');
+        if (!shouldKeepContent(ent.name, content)) continue;
         out.push({ path: path.relative(notesDir, full).split(path.sep).join('/'), mtime: st.mtimeMs, content });
       }
     }
@@ -399,7 +447,7 @@ ipcMain.handle('theme:accent', () => {
 ipcMain.handle('keys:get', async () => (await readConfig()).keybindings ?? {});
 
 ipcMain.handle('keys:set', async (_e, overrides: KeyOverrides) => {
-  await writeFile(configPath(), JSON.stringify({ ...(await readConfig()), keybindings: overrides }, null, 2));
+  await patchConfig({ keybindings: overrides });
   buildMenu(resolveBindings(overrides));
 });
 
@@ -431,6 +479,7 @@ app.whenReady().then(async () => {
   });
   buildMenu(resolveBindings((await readConfig()).keybindings ?? {}));
   createWindow();
+  cloud.start();
   if (process.platform !== 'darwin') openPaths(filesFromArgv(process.argv));
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

@@ -54,10 +54,21 @@ export function parseFolders(json: string | null): NoteFolders {
   return { daily: pick('daily'), topic: pick('topic'), moc: pick('moc') };
 }
 
-/** 노트 폴더 기준 경로. 이름에 폴더가 들어 있으면 그대로 쓴다 */
-export function kindNotePath(folder: string, name: string): string {
-  const rel = name.includes('/') ? name : `${folder}/${name}`;
-  return /\.md$/i.test(rel) ? rel : `${rel}.md`;
+/** 노트 폴더 기준 경로. 이름에 폴더가 들어 있거나 folder가 비었으면 이름 그대로 쓰고, 확장자(기본 md)가 없으면 붙인다 */
+export function kindNotePath(folder: string, name: string, ext = 'md'): string {
+  const rel = name.includes('/') || !folder ? name : `${folder}/${name}`;
+  return rel.toLowerCase().endsWith(`.${ext.toLowerCase()}`) ? rel : `${rel}.${ext}`;
+}
+
+/** 형식별 새 파일 첫 내용. md는 제목 한 줄, html은 최소 HTML5 틀, 나머지는 빈 파일 */
+export function formatContent(ext: string, title: string): string {
+  const e = ext.toLowerCase();
+  if (e === 'md' || e === 'markdown') return `# ${title}\n\n`;
+  if (e === 'html' || e === 'htm') {
+    const t = title.replace(/[&<>]/g, (c) => `&#${c.charCodeAt(0)};`);
+    return ['<!DOCTYPE html>', '<html lang="ko">', '<head>', '  <meta charset="utf-8">', `  <title>${t}</title>`, '</head>', '<body>', '', '</body>', '</html>', ''].join('\n');
+  }
+  return '';
 }
 
 export function kindNoteContent(kind: NoteKind, title: string): string {

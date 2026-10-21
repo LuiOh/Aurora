@@ -10,7 +10,7 @@ function fakeDir(name: string, tree: Tree): DirHandleLike {
   const file = (fname: string): FileHandleLike => ({
     kind: 'file',
     name: fname,
-    getFile: async () => ({ text: async () => tree[fname] as string, lastModified: 1000 }),
+    getFile: async () => ({ text: async () => tree[fname] as string, lastModified: 1000, size: (tree[fname] as string).length }),
     createWritable: async () => {
       let buf = '';
       return { write: async (d: string) => void (buf += d), close: async () => void (tree[fname] = buf) };
@@ -48,6 +48,13 @@ describe('웹 노트 폴더', () => {
     await writeText(root, 'new/deep/b.md', '나');
     expect(tree).toEqual({ work: { 'a.md': '가' }, new: { deep: { 'b.md': '나' } } });
     await expect(readText(root, 'missing.md')).rejects.toThrow();
+  });
+  it('텍스트 파일은 모으고, 1MB 넘는 파일과 NUL이 든 파일은 마크다운이 아니면 뺀다', async () => {
+    const big = 'x'.repeat(1024 * 1024 + 1);
+    const root = fakeDir('notes', {
+      'a.txt': '글', 'b.html': '<p>', 'c.png': 'x', 'd.txt': big, 'e.md': big, 'f.json': 'a\0b', 'g.md': 'a\0b', '.h': { 'i.txt': 'i' },
+    });
+    expect((await scanMarkdown(root)).map((f) => f.path)).toEqual(['a.txt', 'b.html', 'e.md', 'g.md']);
   });
   it('.md만 모으고 숨김 폴더와 node_modules는 건너뛴다', async () => {
     const root = fakeDir('notes', {

@@ -1,6 +1,8 @@
 // 브라우저에서 데스크톱 preload API와 같은 모양으로 파일·설정·메뉴·단축키를 제공하는 웹 버전 구현
 import type { AuroraApi } from '../../electron/preload';
 import { commandForInput, resolveBindings, type KeyInput } from '../../electron/keybindings';
+import { defaultAiSettings } from '../../electron/aiShared';
+import { contentHash } from '../../electron/contentHash';
 import { listDaily, readBlob, readText, scanMarkdown, writeText, type DirHandleLike } from './vaultFs';
 import { openWebMenu } from '../ui/webMenu';
 import { IS_MAC } from '../platform';
@@ -156,15 +158,36 @@ export function createWebApi(): AuroraApi {
       throw new Error(`열 수 없는 파일입니다: ${p}`);
     },
 
-    writeFile: async (p, content) => {
+    // expectedHash 비교는 읽은 뒤 쓰는 최선의 확인이다. 웹에는 클라우드 동기화가 없어 끼어드는 쓰기가 드물다
+    writeFile: async (p, content, expectedHash) => {
       const rel = inRoot(p);
-      if (rel && root) return writeText(root, rel, content);
-      if (p.startsWith('/~download/')) return download(p.slice('/~download/'.length), content);
+      if (rel && root) {
+        if (expectedHash !== undefined) {
+          const current = await readText(root, rel).catch(() => null);
+          if (current !== null && contentHash(current) !== expectedHash) return { ok: false, conflict: true };
+        }
+        await writeText(root, rel, content);
+        return { ok: true };
+      }
+      if (p.startsWith('/~download/')) {
+        await download(p.slice('/~download/'.length), content);
+        return { ok: true };
+      }
       const handle = opened.get(p)?.handle;
       if (!handle) throw new Error('웹에서는 이 파일을 덮어쓸 수 없습니다. 다른 이름으로 저장을 쓰세요.');
       const w = await handle.createWritable();
       await w.write(content);
       await w.close();
+      return { ok: true };
+    },
+
+    // 웹은 "없을 때만 만들기"가 없어 있는지 먼저 본 뒤 쓴다 (그 사이에 생기는 경우까지는 막지 못한다)
+    createFile: async (p, content) => {
+      const rel = inRoot(p);
+      if (!rel || !root) throw new Error('웹에서는 노트 폴더 안에만 새 파일을 만들 수 있습니다.');
+      if (await readBlob(root, rel).then(() => true, () => false)) return false;
+      await writeText(root, rel, content);
+      return true;
     },
 
     // 첨부는 노트 폴더 안에만 쓸 수 있다. 브라우저는 끌어다 놓은 파일의 경로를 모르므로 복사 대신 바이트를 쓴다
@@ -259,5 +282,32 @@ export function createWebApi(): AuroraApi {
     },
     // 브라우저에는 운영체제가 파일을 넘겨주는 길이 없다
     onOpenPath: () => {},
+    // 웹 버전은 키를 안전하게 둘 곳이 없어 AI 채팅을 끈다
+    aiAvailable: false,
+    aiKeyStatus: async () => ({ storage: 'unavailable', keys: { openai: false, anthropic: false, gemini: false } }),
+    aiSaveKey: async () => WEB_AI_OFF,
+    aiDeleteKey: async () => {},
+    aiListModels: async () => WEB_AI_OFF,
+    getAiSettings: async () => defaultAiSettings(),
+    setAiSettings: async () => {},
+    aiHistoryDir: async () => '',
+    aiListChats: async () => [],
+    aiChat: async () => {
+      throw new Error(WEB_AI_OFF.message);
+    },
+    aiAbort: async () => {},
+    onAiEvent: () => () => {},
+    // 웹 버전은 비밀 키를 안전하게 둘 곳이 없어 클라우드 저장소를 끈다
+    cloudAvailable: false,
+    getCloudSettings: async () => ({ mode: 'local', cloud: null, hasSecret: false, status: { state: 'off' } }),
+    testCloud: async () => WEB_CLOUD_OFF,
+    previewCloud: async () => WEB_CLOUD_OFF,
+    enableCloud: async () => WEB_CLOUD_OFF,
+    disableCloud: async () => {},
+    syncNow: async () => {},
+    onCloudEvent: () => () => {},
   };
 }
+
+const WEB_CLOUD_OFF = { ok: false, kind: 'bad-request', message: '웹 버전에서는 클라우드 저장소를 쓸 수 없습니다' } as const;
+const WEB_AI_OFF = { ok: false, kind: 'bad-request', message: '웹 버전에서는 AI 채팅을 쓸 수 없습니다' } as const;

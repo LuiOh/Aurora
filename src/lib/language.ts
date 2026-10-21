@@ -4,8 +4,8 @@ const EXT_TO_LANG: Record<string, string> = {
   js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
   ts: 'typescript', tsx: 'typescript',
   json: 'json', xml: 'xml', html: 'html', htm: 'html', css: 'css', scss: 'scss',
-  md: 'markdown', py: 'python', java: 'java', kt: 'kotlin', sql: 'sql',
-  sh: 'shell', zsh: 'shell', yml: 'yaml', yaml: 'yaml', go: 'go', rs: 'rust',
+  md: 'markdown', markdown: 'markdown', py: 'python', java: 'java', kt: 'kotlin', sql: 'sql',
+  sh: 'shell', bash: 'shell', zsh: 'shell', yml: 'yaml', yaml: 'yaml', go: 'go', rs: 'rust',
   swift: 'swift', c: 'c', h: 'c', cpp: 'cpp', cs: 'csharp', php: 'php', rb: 'ruby',
 };
 

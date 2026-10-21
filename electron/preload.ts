@@ -1,5 +1,11 @@
 // 렌더러에 파일·클립보드·메뉴 기능만 좁게 열어 주는 preload 스크립트
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
+import type { ChatEvent, Provider } from './ai/types';
+import type { AiChatRequest, AiKeyStatus, AiModelsResult, AiSettings, ChatFileInfo } from './aiShared';
+import type {
+  CloudEvent, CloudPreviewResult, CloudResult, CloudSettingsInput, CloudSettingsView, CloudTestResult,
+} from './cloud/types';
+import type { WriteResult } from './contentHash';
 import type { KeyInput } from './keybindings';
 import { fileUrl, toSlash } from './paths';
 
@@ -14,7 +20,11 @@ const api = {
       path: toSlash(f.path),
     })),
   readFile: (path: string): Promise<string> => ipcRenderer.invoke('file:read', path),
-  writeFile: (path: string, content: string): Promise<void> => ipcRenderer.invoke('file:write', path, content),
+  /** expectedHash를 주면 디스크 내용이 그 해시와 다를 때 쓰지 않고 { ok: false, conflict: true }를 돌려준다 */
+  writeFile: (path: string, content: string, expectedHash?: string): Promise<WriteResult> =>
+    ipcRenderer.invoke('file:write', path, content, expectedHash),
+  /** 파일이 없을 때만 만든다. 만들었으면 true, 이미 있으면 덮지 않고 false */
+  createFile: (path: string, content: string): Promise<boolean> => ipcRenderer.invoke('file:create', path, content),
   writeBinary: (path: string, data: Uint8Array): Promise<void> => ipcRenderer.invoke('file:write-binary', path, data),
   /** 끌어다 놓은 파일을 복사한다. from이 없으면(웹) false를 돌려주고 바이트를 쓰게 한다 */
   copyFile: async (from: string, to: string): Promise<boolean> => {
@@ -67,6 +77,46 @@ const api = {
   recordKeys: (on: boolean) => ipcRenderer.send('keys:record', on),
   onKeyPressed: (handler: (input: KeyInput) => void) => {
     ipcRenderer.on('keys:pressed', (_e, input: KeyInput) => handler(input));
+  },
+  // AI 채팅. 키 값은 메인 프로세스에만 있고 화면에는 저장 여부만 알려 준다
+  aiAvailable: true as boolean,
+  aiKeyStatus: (): Promise<AiKeyStatus> => ipcRenderer.invoke('ai:key-status'),
+  /** 키로 모델 목록을 먼저 받아 보고, 성공했을 때만 저장한다 */
+  aiSaveKey: (provider: Provider, key: string): Promise<AiModelsResult> => ipcRenderer.invoke('ai:save-key', provider, key),
+  aiDeleteKey: (provider: Provider): Promise<void> => ipcRenderer.invoke('ai:delete-key', provider),
+  aiListModels: (provider: Provider): Promise<AiModelsResult> => ipcRenderer.invoke('ai:models', provider),
+  getAiSettings: (): Promise<AiSettings> => ipcRenderer.invoke('ai:settings-get'),
+  setAiSettings: (s: AiSettings): Promise<void> => ipcRenderer.invoke('ai:settings-set', s),
+  aiHistoryDir: (): Promise<string> => ipcRenderer.invoke('ai:history-dir'),
+  aiListChats: (dir: string): Promise<ChatFileInfo[]> => ipcRenderer.invoke('ai:list-chats', dir),
+  /** 요청 id를 바로 돌려준다. 내용은 onAiEvent로 온다 */
+  aiChat: (req: AiChatRequest): Promise<string> => ipcRenderer.invoke('ai:chat', req),
+  aiAbort: (id: string): Promise<void> => ipcRenderer.invoke('ai:abort', id),
+  /** 구독을 끊는 함수를 돌려준다 */
+  onAiEvent: (cb: (id: string, ev: ChatEvent) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, id: string, ev: ChatEvent) => cb(id, ev);
+    ipcRenderer.on('ai:event', listener);
+    return () => {
+      ipcRenderer.removeListener('ai:event', listener);
+    };
+  },
+  // 클라우드 저장소. 비밀 키는 메인 프로세스에만 있고 화면에는 저장 여부만 알려 준다
+  cloudAvailable: true as boolean,
+  getCloudSettings: (): Promise<CloudSettingsView> => ipcRenderer.invoke('cloud:get-settings'),
+  /** secret을 빼면 저장된 비밀 키로 확인한다 */
+  testCloud: (cfg: CloudSettingsInput, secret?: string): Promise<CloudTestResult> => ipcRenderer.invoke('cloud:test', cfg, secret),
+  /** 아무것도 옮기지 않고 첫 동기화에서 올릴·받을 파일 수와 크기를 센다 */
+  previewCloud: (cfg: CloudSettingsInput, secret?: string): Promise<CloudPreviewResult> => ipcRenderer.invoke('cloud:preview', cfg, secret),
+  /** 확인에 성공하면 설정을 저장하고 클라우드 모드로 바꾼 뒤 첫 동기화를 시작한다. 진행은 onCloudEvent로 온다 */
+  enableCloud: (cfg: CloudSettingsInput, secret?: string): Promise<CloudResult> => ipcRenderer.invoke('cloud:enable', cfg, secret),
+  disableCloud: (): Promise<void> => ipcRenderer.invoke('cloud:disable'),
+  syncNow: (): Promise<void> => ipcRenderer.invoke('cloud:sync-now'),
+  onCloudEvent: (cb: (ev: CloudEvent) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, ev: CloudEvent) => cb(ev);
+    ipcRenderer.on('cloud:event', listener);
+    return () => {
+      ipcRenderer.removeListener('cloud:event', listener);
+    };
   },
 };
 

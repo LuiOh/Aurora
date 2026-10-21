@@ -1,6 +1,7 @@
 // 노트 저장 폴더 설정과 주제·목차 노트의 경로·첫 내용 틀을 검사하는 단위 테스트
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_FOLDERS, cleanFolder, folderFromInput, kindNoteContent, kindNotePath, parseFolders } from '../src/lib/noteKinds';
+import { DEFAULT_FOLDERS, cleanFolder, folderFromInput, formatContent, kindNoteContent, kindNotePath, parseFolders } from '../src/lib/noteKinds';
+import { languageForPath } from '../src/lib/language';
 
 describe('주제·목차 노트', () => {
   it('정한 폴더에 만들고, 이름에 폴더가 있으면 그대로 쓴다', () => {
@@ -45,5 +46,27 @@ describe('저장 위치 입력', () => {
     expect(folderFromInput(root, '/Users/me/Other/주제')).toHaveProperty('error');
     expect(folderFromInput(root, '/Users/me/Notes2/주제')).toHaveProperty('error');
     expect(folderFromInput(root, '../밖')).toHaveProperty('error');
+  });
+});
+
+describe('형식을 고른 새 파일', () => {
+  it('고른 확장자를 붙이고 .md를 덧붙이지 않는다', () => {
+    expect(kindNotePath('주제', '메모', 'txt')).toBe('주제/메모.txt');
+    expect(kindNotePath('주제', '메모.TXT', 'txt')).toBe('주제/메모.TXT');
+    expect(kindNotePath('', '페이지', 'html')).toBe('페이지.html');
+    expect(kindNotePath('', '폴더/a', 'csv')).toBe('폴더/a.csv');
+    expect(kindNotePath('', '노트')).toBe('노트.md');
+  });
+  it('형식별 첫 내용: md는 제목, html은 틀, 나머지는 빈 파일', () => {
+    expect(formatContent('md', '회의')).toBe('# 회의\n\n');
+    const html = formatContent('html', 'A & B');
+    expect(html.startsWith('<!DOCTYPE html>')).toBe(true);
+    expect(html).toContain('<title>A &#38; B</title>');
+    expect(formatContent('json', '설정')).toBe('');
+  });
+  it('형식별 편집기 언어를 고른다', () => {
+    expect(['a.yaml', 'a.yml', 'a.sql', 'a.sh', 'a.py', 'a.csv', 'a.markdown', 'a.log'].map(languageForPath)).toEqual(
+      ['yaml', 'yaml', 'sql', 'shell', 'python', 'plaintext', 'markdown', 'plaintext'],
+    );
   });
 });

@@ -3,7 +3,7 @@ import {
   COMMANDS, RESERVED, acceleratorLabel, findConflict, inputToAccelerator, resolveBindings, toOverrides,
   type KeyInput,
 } from '../../electron/keybindings';
-import { IS_MAC } from '../platform';
+import { IS_MAC, PLATFORM } from '../platform';
 import { api } from '../api';
 
 const labelOf = (id: string) => COMMANDS.find((c) => c.id === id)?.label ?? id;
@@ -51,6 +51,7 @@ export async function openKeybindings(): Promise<Record<string, string> | null> 
       list.innerHTML = '';
       let group = '';
       for (const c of COMMANDS) {
+        if (c.desktopOnly && PLATFORM === 'web') continue;
         if (c.group !== group) {
           group = c.group;
           const h = document.createElement('div');

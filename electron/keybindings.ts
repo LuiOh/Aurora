@@ -6,6 +6,8 @@ export interface CommandDef {
   group: string;
   /** Electron accelerator 형식. 빈 문자열이면 기본 단축키 없음 */
   key: string;
+  /** 데스크톱 앱에서만 쓰는 명령(AI 등). 웹 메뉴·단축키 설정에는 보이지 않는다 */
+  desktopOnly?: boolean;
 }
 
 export const COMMANDS: CommandDef[] = [
@@ -47,6 +49,9 @@ export const COMMANDS: CommandDef[] = [
   { id: 'notes:follow-link', label: '커서의 [[링크]] 따라가기', group: 'Notes', key: 'CmdOrCtrl+Alt+Enter' },
   { id: 'notes:choose-dir', label: '노트 폴더 바꾸기…', group: 'Notes', key: '' },
   { id: 'notes:folders', label: '노트 저장 위치…', group: 'Notes', key: '' },
+  { id: 'notes:storage', label: '저장소 설정…', group: 'Notes', key: '', desktopOnly: true },
+  { id: 'notes:ai-chat', label: 'AI 채팅 열기/닫기', group: 'Notes', key: 'CmdOrCtrl+J', desktopOnly: true },
+  { id: 'notes:ai-settings', label: 'AI 설정…', group: 'Notes', key: '', desktopOnly: true },
   { id: 'app:keybindings', label: '단축키 설정…', group: 'Aurora', key: 'CmdOrCtrl+,' },
 ];
 

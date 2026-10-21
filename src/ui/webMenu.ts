@@ -8,7 +8,7 @@ export function openWebMenu(x: number, y: number, bindings: Record<string, strin
   const menu = document.createElement('div');
   menu.className = 'web-menu';
   for (const group of GROUP_ORDER) {
-    const items = COMMANDS.filter((c) => c.group === group);
+    const items = COMMANDS.filter((c) => c.group === group && !c.desktopOnly);
     if (items.length === 0) continue;
     const head = document.createElement('div');
     head.className = 'web-menu-group';

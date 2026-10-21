@@ -7,21 +7,28 @@ import { prepareForDiff, type DiffOptions } from './lib/diffPrep';
 import { languageForPath, baseName } from './lib/language';
 import { buildDailyNote, dateKey, isDateKey, previousKey, toggleTaskLine } from './lib/daily';
 import {
-  TAG_AT_START, allTasks, backlinks, buildGraph, buildIndex, fuzzyMatch, noteName, parseNote, resolveLink,
+  TAG_AT_START, allTasks, backlinks, buildGraph, buildIndex, displayName, displayPath, fuzzyMatch, noteName, parseNote, resolveLink,
   notesByFolder, searchVault, splitLinkText, tagCounts, unlinkedMentions, type Mention, type VaultFile, type VaultIndex,
 } from './lib/vault';
-import { askFolders, askNoteName, askNumbering, askTab } from './ui/modal';
+import { askConfirm, askFolders, askNoteName, askNumbering, askTab } from './ui/modal';
+import { cloudStatusBar, contentHash, splitChangedTabs } from './lib/diskSync';
+import { applyChangedFields, markTaskDone } from './lib/writeRetry';
+import type { CloudEvent, CloudStatus } from '../electron/cloud/types';
 import { ATTACH_FOLDER, attachmentKind, attachmentMarkdown, isAttachableFile, isAttachmentTarget, pastedImageName, uniqueName } from './lib/attachments';
 import {
-  DEFAULT_FOLDERS, FOLDERS_FILE, NOTE_KIND_LABELS, kindNoteContent, kindNotePath, parseFolders, type NoteFolders, type NoteKind,
+  DEFAULT_FOLDERS, FOLDERS_FILE, NOTE_KIND_LABELS, formatContent, kindNoteContent, kindNotePath, parseFolders, type NoteFolders, type NoteKind,
 } from './lib/noteKinds';
 import { openKeybindings } from './ui/keybindingsModal';
 import { openPicker, type PickerItem } from './ui/picker';
 import { createGraphView } from './ui/graphView';
+import { createSidePane } from './ui/sidePane';
+import type { AiNoteImage, ChatPanel, NoteContext } from './ui/chatPanel';
 import { IS_MAC, PLATFORM } from './platform';
 import { api } from './api';
 import { COMMANDS, acceleratorLabel, resolveBindings } from '../electron/keybindings';
+import { isTextPath, previewMode, splitKnownExtension } from '../electron/fileTypes';
 import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -34,6 +41,8 @@ interface Tab {
   viewState: monaco.editor.ICodeEditorViewState | null;
   /** 저장하기 전 탭에 붙여 넣은 첨부(첨부 폴더 안 이름 → 내용). 탭을 저장할 때 함께 쓴다 */
   pending: Map<string, Blob>;
+  /** 탭을 열거나 다시 읽거나 저장했을 때의 디스크 내용 해시. 저장 전에 다른 곳에서 바뀌었는지 볼 때 쓴다 */
+  diskHash: string | null;
 }
 
 const tabs: Tab[] = [];
@@ -133,7 +142,10 @@ function renderTabs() {
 function addTab(path: string | null, content: string): Tab {
   const title = path ? baseName(path) : `제목 없음 ${++untitledCount}`;
   const model = monaco.editor.createModel(content, languageForPath(path));
-  const tab: Tab = { id: nextId++, path, title, model, savedVersionId: model.getAlternativeVersionId(), viewState: null, pending: new Map() };
+  const tab: Tab = {
+    id: nextId++, path, title, model, savedVersionId: model.getAlternativeVersionId(), viewState: null, pending: new Map(),
+    diskHash: path ? contentHash(content) : null,
+  };
   model.onDidChangeContent(() => {
     renderTabs();
     if (tab === active) schedulePreview();
@@ -196,19 +208,40 @@ async function save(tab: Tab, saveAs = false) {
     path = await api.saveDialog(tab.path ?? tab.title + (tab.model.getLanguageId() === 'markdown' ? '.md' : '.txt'));
     if (!path) return;
   }
+  // 열어 둔 파일에 다시 저장할 때는 열거나 저장한 때의 해시를 기준으로 건다. 그사이 디스크가 바뀌었으면 메인이 쓰지 않고 알려 준다
+  const expected = path === tab.path ? tab.diskHash ?? undefined : undefined;
+  let written: string;
   try {
     await savePending(tab, path);
-    await api.writeFile(path, tab.model.getValue());
+    written = tab.model.getValue();
+    const res = await api.writeFile(path, written, expected);
+    if (!res.ok) {
+      if (!(await confirmOverwrite(tab))) {
+        return status(`저장하지 않았습니다. 다른 이름으로 저장(${keyHint('file:save-as')})한 뒤 디스크의 두 파일 비교로 견줘 볼 수 있습니다.`);
+      }
+      written = tab.model.getValue();
+      await api.writeFile(path, written);
+    }
   } catch (err) {
     return status(`저장하지 못했습니다: ${(err as Error).message}`);
   }
   tab.path = path;
   tab.title = baseName(path);
+  tab.diskHash = contentHash(written);
   tab.savedVersionId = tab.model.getAlternativeVersionId();
   monaco.editor.setModelLanguage(tab.model, languageForPath(path));
   status(`저장했습니다: ${path}`);
   renderTabs();
   if (relPath(path)) await refreshVault();
+}
+
+/** 파일이 탭을 연 뒤 Aurora 밖(또는 다른 기기)에서 바뀌어 저장이 막혔을 때 덮어쓸지 묻는다 */
+function confirmOverwrite(tab: Tab): Promise<boolean> {
+  return askConfirm(
+    `‘${tab.title}’ 저장`,
+    '이 파일이 Aurora 밖(또는 다른 기기)에서 바뀌었습니다. 덮어쓰면 그쪽에서 바꾼 내용이 사라집니다.',
+    '덮어쓰기',
+  );
 }
 
 /**
@@ -275,6 +308,35 @@ function attachmentPath(target: string, wiki = false): string | null {
   return `${dirOfPath(note)}/${target.replace(/^\.\//, '')}`;
 }
 
+/** 첨부할 내용. srcPath가 있으면 그 파일을 복사하고, 없으면 blob을 쓴다 */
+interface AttachItem { name: string; blob?: Blob; srcPath?: string }
+
+/**
+ * 첨부를 탭의 노트 옆 첨부 폴더에 저장하고 넣을 마크다운 줄을 돌려준다.
+ * 저장하지 않은 탭이면 첨부를 탭에 들고 있다가 탭을 저장할 때 함께 쓴다
+ */
+async function storeAttachments(tab: Tab, items: AttachItem[]): Promise<string[]> {
+  const dir = tab.path ? `${dirOfPath(tab.path)}/${ATTACH_FOLDER}` : null;
+  const lines: string[] = [];
+  for (const item of items) {
+    if (!dir) {
+      if (!item.blob) throw new Error('저장하지 않은 탭에는 기록에서 연 그림을 넣을 수 없습니다. 탭을 먼저 저장해 주세요');
+      const name = await uniqueName(item.name, (n) => tab.pending.has(n));
+      tab.pending.set(name, item.blob);
+      lines.push(attachmentMarkdown(name));
+      continue;
+    }
+    const name = await uniqueName(item.name, (n) => api.exists(`${dir}/${n}`));
+    const dest = `${dir}/${name}`;
+    if (!(item.srcPath && (await api.copyFile(item.srcPath, dest)))) {
+      if (!item.blob) throw new Error(`${item.name}을 읽지 못했습니다`);
+      await api.writeBinary(dest, new Uint8Array(await item.blob.arrayBuffer()));
+    }
+    lines.push(attachmentMarkdown(name));
+  }
+  return lines;
+}
+
 /**
  * 파일을 노트 옆 첨부 폴더에 저장하고 커서 자리에 링크를 넣는다.
  * 저장하지 않은 탭이면 첨부를 탭에 들고 있다가 탭을 저장할 때 함께 쓴다
@@ -283,23 +345,14 @@ async function attachFiles(files: File[]) {
   const tab = active;
   if (!tab) return;
   const dir = tab.path ? `${dirOfPath(tab.path)}/${ATTACH_FOLDER}` : null;
-  const lines: string[] = [];
+  let lines: string[];
   try {
-    for (const file of files) {
+    lines = await storeAttachments(tab, files.map((file) => ({
       // 클립보드 이미지는 이름이 image.png 같은 기본값이라 시각을 넣은 이름을 붙인다
-      const raw = file.type.startsWith('image/') && /^image\.\w+$/.test(file.name) ? pastedImageName(new Date(), file.type) : file.name;
-      if (!dir) {
-        const name = await uniqueName(raw, (n) => tab.pending.has(n));
-        tab.pending.set(name, file);
-        lines.push(attachmentMarkdown(name));
-        continue;
-      }
-      const name = await uniqueName(raw, (n) => api.exists(`${dir}/${n}`));
-      const dest = `${dir}/${name}`;
-      const src = PLATFORM === 'web' ? '' : api.pathForFile(file);
-      if (!(src && (await api.copyFile(src, dest)))) await api.writeBinary(dest, new Uint8Array(await file.arrayBuffer()));
-      lines.push(attachmentMarkdown(name));
-    }
+      name: file.type.startsWith('image/') && /^image\.\w+$/.test(file.name) ? pastedImageName(new Date(), file.type) : file.name,
+      blob: file,
+      srcPath: dir && PLATFORM !== 'web' ? api.pathForFile(file) : '',
+    })));
   } catch (e) {
     return status(`첨부하지 못했습니다: ${(e as Error).message}`);
   }
@@ -428,7 +481,7 @@ function showCompare(left: Side, right: Side) {
   $('compare-title').textContent = `${left.title}  ↔  ${right.title}`;
   $('compare-bar').hidden = false;
   $('editor-host').hidden = true;
-  $('preview').hidden = true;
+  sidePane.setVisible(false);
   $('diff-host').hidden = false;
   applyCompareModels();
 }
@@ -459,7 +512,7 @@ function closeCompare() {
   $('compare-bar').hidden = true;
   $('diff-host').hidden = true;
   $('editor-host').hidden = false;
-  $('preview').hidden = !previewOn;
+  sidePane.setVisible(previewOn && !graphOn);
   editor.focus();
 }
 
@@ -538,6 +591,8 @@ $('opt-case').addEventListener('change', (e) => {
 let notesDir: string | null = null;
 let noteKeys: string[] = [];
 let folders: NoteFolders = DEFAULT_FOLDERS;
+/** 마지막으로 읽은 folders.json 내용의 해시. 파일이 없었으면 빈 내용의 해시라 그사이 생긴 파일도 덮지 않는다 */
+let foldersHash = contentHash('');
 const today = new Date();
 let calYear = today.getFullYear();
 let calMonth = today.getMonth();
@@ -555,7 +610,9 @@ const notePath = (key: string) => `${notesDir}/${folders.daily}/${key}.md`;
 
 /** 노트 폴더의 저장 위치 설정을 읽고 데일리 노트 날짜 목록을 가져온다 */
 async function loadNoteKeys() {
-  folders = parseFolders(await api.readFile(`${notesDir}/${FOLDERS_FILE}`).catch(() => null));
+  const raw = await api.readFile(`${notesDir}/${FOLDERS_FILE}`).catch(() => null);
+  folders = parseFolders(raw);
+  foldersHash = contentHash(raw ?? '');
   noteKeys = await api.listNotes(notesDir!, folders.daily);
 }
 
@@ -563,11 +620,20 @@ async function changeFolders() {
   if (!(await ensureNotesDir())) return status('노트 폴더를 먼저 골라야 합니다.');
   const next = await askFolders(folders, notesDir!, PLATFORM === 'web' ? null : api.chooseFolder);
   if (!next) return;
-  await api.writeFile(`${notesDir}/${FOLDERS_FILE}`, JSON.stringify(next, null, 2) + '\n');
+  const file = `${notesDir}/${FOLDERS_FILE}`;
+  const text = (f: NoteFolders) => JSON.stringify(f, null, 2) + '\n';
+  if (!(await api.writeFile(file, text(next), foldersHash)).ok) {
+    // 다른 기기에서 바뀐 설정을 다시 읽고, 이번에 바꾼 칸만 그 위에 얹어 한 번 더 쓴다
+    const raw = await api.readFile(file).catch(() => null);
+    const merged = applyChangedFields(parseFolders(raw), folders, next);
+    if (!(await api.writeFile(file, text(merged), contentHash(raw ?? ''))).ok) {
+      return status('저장 위치 설정이 다른 곳에서 계속 바뀌어 저장하지 못했습니다. 다시 해 보세요.');
+    }
+  }
   await loadNoteKeys();
   renderCalendar();
   await refreshVault();
-  status(`저장 위치를 바꿨습니다: 날짜 ${next.daily}/, 주제 ${next.topic}/, 목차 ${next.moc}/`);
+  status(`저장 위치를 바꿨습니다: 날짜 ${folders.daily}/, 주제 ${folders.topic}/, 목차 ${folders.moc}/`);
 }
 
 /** 열린 탭이 데일리 노트면 그 날짜를 돌려준다 */
@@ -579,10 +645,19 @@ function activeNoteKey(): string | null {
 
 async function ensureNotesDir(): Promise<boolean> {
   notesDir ??= await api.getNotesDir();
-  notesDir ??= await api.chooseNotesDir();
+  let openCloudSetup = false;
+  if (!notesDir) {
+    // 데스크톱에서 처음 노트 폴더를 고를 때는 로컬과 클라우드 중 어디에 둘지 먼저 묻는다
+    const kind = api.cloudAvailable ? await (await import('./ui/storageModal')).askStorageKind() : 'local';
+    if (!kind) return false;
+    if (kind === 'cloud') status('클라우드 노트의 작업 사본을 둘 폴더를 고르세요. 다른 PC에서 처음 연결한다면 빈 폴더를 고르세요.');
+    notesDir = await api.chooseNotesDir();
+    openCloudSetup = kind === 'cloud';
+  }
   if (!notesDir) return false;
   await loadNoteKeys();
   showNotesDir(notesDir);
+  if (openCloudSetup) void openStorageModal('cloud');
   return true;
 }
 
@@ -590,25 +665,41 @@ async function openNote(key: string) {
   if (!(await ensureNotesDir())) return status('노트 폴더를 골라야 노트를 쓸 수 있습니다.');
   const path = notePath(key);
   if (!noteKeys.includes(key)) {
-    // 처음 여는 날이면 가장 최근 노트에서 일감을 넘겨받아 새로 만든다
+    // 처음 여는 날이면 가장 최근 노트에서 일감을 넘겨받아 새로 만든다. 그사이 다른 기기에서 받았으면 그 파일을 연다
     const prevKey = previousKey(noteKeys, key);
     const prev = prevKey ? { key: prevKey, content: await api.readFile(notePath(prevKey)) } : null;
-    await api.writeFile(path, buildDailyNote(key, prev));
+    const created = await api.createFile(path, buildDailyNote(key, prev));
     noteKeys = [...noteKeys, key].sort();
-    status(prev ? `${key} 노트를 만들고 ${prevKey} 노트의 일감을 넘겨받았습니다.` : `${key} 노트를 만들었습니다.`);
+    if (!created) await refreshVault();
+    status(!created ? `${key} 노트가 이미 있어 그대로 엽니다.` : prev ? `${key} 노트를 만들고 ${prevKey} 노트의 일감을 넘겨받았습니다.` : `${key} 노트를 만들었습니다.`);
   }
   openContent(path, await api.readFile(path));
   if (!previewOn) togglePreview();
 }
 
-async function changeNotesDir() {
+const CLOUD_DIR_CHANGE_TEXT = '클라우드와 맞추는 중에는 노트 폴더를 바꾸면 클라우드 연결을 끊습니다. 새 폴더를 클라우드와 맞추려면 저장소 설정에서 다시 클라우드로 바꾸세요.';
+
+async function changeNotesDir(): Promise<string | null> {
+  if (api.cloudAvailable && (await api.getCloudSettings()).mode === 'cloud') {
+    if (!(await askConfirm('노트 폴더 바꾸기', CLOUD_DIR_CHANGE_TEXT, '계속'))) return null;
+  }
+  // 클라우드 연결은 새 폴더를 실제로 고른 뒤 메인 프로세스가 끊는다. 고르기를 취소하면 그대로 둔다
   const dir = await api.chooseNotesDir();
-  if (!dir) return;
+  if (!dir) return null;
   notesDir = dir;
   await loadNoteKeys();
   showNotesDir(dir);
   renderCalendar();
   await refreshVault();
+  return dir;
+}
+
+/** 저장소 설정 창(데스크톱 전용). 창은 처음 열 때 불러온다 */
+async function openStorageModal(initialMode?: 'local' | 'cloud') {
+  if (!api.cloudAvailable) return;
+  notesDir ??= await api.getNotesDir();
+  const { openStorageSettings } = await import('./ui/storageModal');
+  await openStorageSettings({ getNotesDir: () => notesDir, changeNotesDir, initialMode });
 }
 
 function renderCalendar() {
@@ -692,10 +783,34 @@ function toggleTasks() {
 let previewOn = false;
 let previewTimer: number | undefined;
 
+// 미리보기를 담는 오른쪽 사이드 창. AI 버튼과 채팅 자리는 데스크톱 앱에서만 보인다
+const sidePane = createSidePane({
+  workspace: $('workspace'),
+  pane: $('side-pane'),
+  preview: $('preview'),
+  chatHost: $('chat-host'),
+  widthHandle: $('side-resizer'),
+  splitHandle: $('chat-splitter'),
+  fab: $('chat-fab'),
+  chatEnabled: PLATFORM !== 'web',
+});
+
 function renderPreview() {
   if (!previewOn || !active) return;
-  $('preview').innerHTML = marked.parse(active.model.getValue(), { async: false });
-  void loadMedia($('preview'));
+  const preview = $('preview');
+  const text = active.model.getValue();
+  const mode = previewMode(active.path);
+  if (mode === 'plain') {
+    const pre = document.createElement('pre');
+    pre.className = 'plain-preview';
+    pre.textContent = text;
+    preview.replaceChildren(pre);
+    return;
+  }
+  // 노트에 넣은 AI 답변이나 웹에서 붙여 넣은 HTML이 화면에서 스크립트를 돌리지 못하게 거른다
+  const html = mode === 'html' ? text : marked.parse(text, { async: false });
+  preview.innerHTML = DOMPurify.sanitize(html, { FORBID_TAGS: ['form', 'style'] });
+  void loadMedia(preview);
 }
 
 /** 첨부 하나를 미리보기 요소로. 이미지·영상·오디오는 바로 보이고, 그 밖의 파일은 눌러서 기본 앱으로 연다 */
@@ -751,8 +866,89 @@ function schedulePreview() {
 
 function togglePreview() {
   previewOn = !previewOn;
-  $('preview').hidden = !previewOn || !!compare || graphOn;
+  sidePane.setVisible(previewOn && !compare && !graphOn);
   renderPreview();
+}
+
+// ───────── AI 채팅 (데스크톱 전용, 채팅 화면은 처음 쓸 때 불러온다) ─────────
+
+let chatPanel: Promise<ChatPanel> | null = null;
+
+/** 채팅 화면을 한 번만 만든다. 실패하면 알리고 다음에 다시 만들 수 있게 비워 둔다 */
+function ensureChatPanel(): Promise<ChatPanel | null> {
+  chatPanel ??= import('./ui/chatPanel').then((m) =>
+    m.createChatPanel(sidePane.chatHost, { status, getNoteContext, describeNoteContext, insertIntoNote, openSettings: () => void openAiSettingsModal() }),
+  );
+  return chatPanel.catch((e: unknown) => {
+    chatPanel = null;
+    status(`AI 채팅을 열지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  });
+}
+
+/** 마크다운 노트(또는 경로 없는 새 탭)일 때만 AI에 보낸다 — 노트에 넣기와 같은 기준 */
+const isMarkdownTab = (t: NonNullable<typeof active>) => t.model.getLanguageId() === 'markdown' || !t.path;
+
+function getNoteContext(): NoteContext {
+  if (!active || compare || graphOn || !isMarkdownTab(active)) return {};
+  const sel = editor.getSelection();
+  const selection = sel && !sel.isEmpty() ? active.model.getValueInRange(sel) : undefined;
+  return { noteTitle: active.title, noteText: active.model.getValue(), selection };
+}
+
+/** AI 답변을 마크다운 노트의 선택 영역(없으면 커서 자리)에 넣는다. ⌘Z 한 번으로 되돌릴 수 있다 */
+function describeNoteContext(): string {
+  if (!active || compare || graphOn) return '열린 노트가 없어 보내지 않습니다';
+  if (!isMarkdownTab(active)) return '마크다운 노트가 아니라 보내지 않습니다';
+  return `보낼 노트: ${active.title}`;
+}
+
+/** images는 노트 옆 첨부 폴더에 저장하고, compose가 그 링크 줄로 넣을 글을 만든다 */
+async function insertIntoNote(compose: (imageLines: string[]) => string, images: AiNoteImage[] = []) {
+  const tab = active;
+  if (!tab || compare || !isMarkdownTab(tab)) {
+    return status('마크다운 노트를 연 상태에서 넣을 수 있습니다');
+  }
+  let lines: string[] = [];
+  try {
+    lines = await storeAttachments(tab, images);
+  } catch (e) {
+    return status(`그림을 첨부하지 못했습니다: ${(e as Error).message}`);
+  }
+  if (active !== tab || compare) return status('다른 탭으로 옮겨서 노트에 넣지 않았습니다');
+  editor.pushUndoStop();
+  editor.executeEdits('ai-insert', [{ range: editor.getSelection()!, text: compose(lines), forceMoveMarkers: true }]);
+  editor.pushUndoStop();
+  editor.focus();
+  status(images.length > 0 ? `AI 답변과 그림 ${images.length}개를 노트에 넣었습니다` : 'AI 답변을 노트에 넣었습니다');
+}
+
+async function toggleAiChat() {
+  if (!api.aiAvailable) return;
+  if (compare || graphOn) return status('비교나 그래프 화면을 닫은 뒤 AI 채팅을 쓸 수 있습니다');
+  const hadFocus = sidePane.chatHost.contains(document.activeElement);
+  if (previewOn) sidePane.toggleChat();
+  else {
+    togglePreview();
+    sidePane.showChat(true);
+  }
+  if (sidePane.isChatVisible()) (await ensureChatPanel())?.focus();
+  else if (hadFocus) editor.focus();
+}
+
+async function openAiSettingsModal() {
+  if (!api.aiAvailable) return;
+  const { openAiSettings } = await import('./ui/aiSettingsModal');
+  await openAiSettings({
+    getMode: sidePane.getMode,
+    setMode: sidePane.setMode,
+    onChange: () => void chatPanel?.then((p) => p.refresh()),
+  });
+}
+
+if (api.aiAvailable) {
+  sidePane.onChatVisibilityChange((visible) => visible && void ensureChatPanel().then((p) => p?.focus()));
+  if (sidePane.isChatVisible()) void ensureChatPanel();
 }
 
 // ───────── 노트 폴더 색인 ([[링크]]·백링크·태그·할 일) ─────────
@@ -784,7 +980,7 @@ function getIndex(): VaultIndex {
   const open = new Map<string, Tab>();
   for (const t of tabs) {
     const rel = t.path && relPath(t.path);
-    if (rel && rel.toLowerCase().endsWith('.md')) open.set(rel, t);
+    if (rel && isTextPath(rel)) open.set(rel, t);
   }
   const files = vaultFiles.map((f) => (open.has(f.path) ? { path: f.path, content: open.get(f.path)!.model.getValue() } : f));
   vaultIndex = buildIndex(files);
@@ -838,9 +1034,9 @@ async function followLink(target: string, subpath = '') {
   if (dest) return openVaultNote(dest, { subpath });
   if (!target) return;
   const rel = /\.md$/i.test(target) ? target : `${target}.md`;
-  await api.writeFile(`${notesDir}/${rel}`, `# ${noteName(rel)}\n\n`);
+  const created = await api.createFile(`${notesDir}/${rel}`, `# ${noteName(rel)}\n\n`);
   await refreshVault();
-  status(`새 노트를 만들었습니다: ${rel}`);
+  status(created ? `새 노트를 만들었습니다: ${rel}` : `이미 있는 노트를 엽니다: ${rel}`);
   await openVaultNote(rel);
 }
 
@@ -989,10 +1185,11 @@ function renderSidePanel() {
     };
     button('날짜', () => void openNote(dateKey(new Date())));
     for (const kind of Object.keys(NOTE_KIND_LABELS) as NoteKind[]) button(NOTE_KIND_LABELS[kind], () => void newNote(kind));
+    button('파일', () => void newFile());
     panel.append(add);
     const current = active?.path && relPath(active.path);
     // 데일리 노트는 달력으로 찾으므로 목록에서 뺀다
-    for (const { folder, notes } of notesByFolder(index.files.map((f) => f.path), [folders.daily])) {
+    for (const { folder, notes } of notesByFolder(index.allFiles.map((f) => f.path), [folders.daily])) {
       const head = document.createElement('div');
       head.className = 'sec';
       head.textContent = folder || '노트 폴더';
@@ -1004,7 +1201,7 @@ function renderSidePanel() {
         // 오른쪽 숫자는 이 노트를 링크한 노트 수
         el.innerHTML = '<span class="count"></span><span></span>';
         el.children[0].textContent = String(new Set(backlinks(index, rel).map((b) => b.source)).size || '');
-        el.children[1].textContent = noteName(rel);
+        el.children[1].textContent = displayName(rel);
         el.title = rel;
         el.onclick = () => void openVaultNote(rel);
         panel.append(el);
@@ -1069,26 +1266,52 @@ async function completeTask(rel: string, line: number) {
     tab.model.pushEditOperations([], [{ range: new monaco.Range(n, 1, n, tab.model.getLineMaxColumn(n)), text: done(tab.model.getLineContent(n)) }], () => null);
     return status(`${noteName(rel)} 탭에서 끝낸 일로 바꿨습니다. 저장해야 파일에 반영됩니다.`);
   }
-  const lines = (await api.readFile(abs)).split('\n');
-  lines[line] = done(lines[line]);
-  await api.writeFile(abs, lines.join('\n'));
+  // 읽은 내용의 해시를 걸어 쓴다. 그사이 다른 기기에서 바뀌었으면 다시 읽어 같은 할 일 줄을 찾아 한 번 더 해 본다
+  let want: string | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const text = await api.readFile(abs);
+    want ??= text.split('\n')[line] ?? '';
+    const next = markTaskDone(text, line, want);
+    if (next === null) break;
+    if ((await api.writeFile(abs, next, contentHash(text))).ok) {
+      await refreshVault();
+      return status(`${noteName(rel)}의 할 일을 끝낸 일로 바꿨습니다.`);
+    }
+  }
   await refreshVault();
-  status(`${noteName(rel)}의 할 일을 끝낸 일로 바꿨습니다.`);
+  status(`${noteName(rel)}이 다른 곳에서 바뀌어 할 일을 바꾸지 못했습니다. 노트를 열어 확인하세요.`);
 }
 
-/** 이름을 물어 주제·목차 노트를 그 종류 폴더에 틀과 함께 만든다. 이미 있으면 그 노트를 연다 */
+/** 확장자를 뗀 파일 이름. 새 파일의 제목으로 쓴다 */
+const titleOf = (rel: string) => splitKnownExtension(baseName(rel)).base;
+
+/** rel 파일이 없으면 content로 만들고 what(예: "새 파일을")으로 알린 뒤 연다. 색인에 없어도 디스크에 있으면 덮지 않고 연다 */
+async function createOrOpen(rel: string, content: string, what: string) {
+  if (!getIndex().allFiles.some((f) => f.path === rel)) {
+    const created = await api.createFile(`${notesDir}/${rel}`, content);
+    await refreshVault();
+    status(created ? `${what} 만들었습니다: ${rel}` : `이미 있는 파일을 엽니다: ${rel}`);
+  }
+  await openVaultNote(rel);
+}
+
+/** 이름과 형식을 물어 주제·목차 노트를 그 종류 폴더에 만든다. md는 틀과 함께, 다른 형식은 형식별 첫 내용으로 만든다 */
 async function newNote(kind: NoteKind) {
   if (!(await ensureVault())) return;
   const label = NOTE_KIND_LABELS[kind];
-  const name = await askNoteName(`새 ${label} 노트`, `${kind === 'topic' ? 'Electron IPC' : '업무 목차'} (${folders[kind]} 폴더에 만듭니다)`);
-  if (!name) return;
-  const rel = kindNotePath(folders[kind], name);
-  if (!getIndex().files.some((f) => f.path === rel)) {
-    await api.writeFile(`${notesDir}/${rel}`, kindNoteContent(kind, noteName(rel)));
-    await refreshVault();
-    status(`새 ${label} 노트를 만들었습니다: ${rel}`);
-  }
-  await openVaultNote(rel);
+  const res = await askNoteName(`새 ${label} 노트`, `${kind === 'topic' ? 'Electron IPC' : '업무 목차'} (${folders[kind]} 폴더에 만듭니다)`);
+  if (!res) return;
+  const rel = kindNotePath(folders[kind], res.name, res.ext);
+  await createOrOpen(rel, res.ext === 'md' ? kindNoteContent(kind, noteName(rel)) : formatContent(res.ext, titleOf(rel)), `새 ${label} 노트를`);
+}
+
+/** 이름과 형식을 물어 노트 폴더 맨 위(또는 적은 폴더/이름)에 파일을 만든다 */
+async function newFile() {
+  if (!(await ensureVault())) return;
+  const res = await askNoteName('새 파일', '회의 메모 또는 폴더/페이지.html');
+  if (!res) return;
+  const rel = kindNotePath('', res.name, res.ext);
+  await createOrOpen(rel, formatContent(res.ext, titleOf(rel)), '새 파일을');
 }
 
 // ───────── 빠른 열기·전체 검색 ─────────
@@ -1099,19 +1322,19 @@ async function quickOpen() {
   openPicker<string>({
     title: '노트 빠르게 열기',
     placeholder: '노트 이름이나 경로 일부를 입력하세요',
-    help: '↑↓ 이동 · Enter 열기 · ⇧Enter 입력한 이름으로 새 노트 만들기',
+    help: '↑↓ 이동 · Enter 열기 · ⇧Enter 입력한 이름으로 새 노트 만들기 (이름 끝에 .txt 같은 확장자를 쓰면 그 형식으로)',
     search: (q) => {
-      const files = getIndex().files;
+      const files = getIndex().allFiles;
       if (!q.trim()) {
         // 검색어가 없으면 열린 탭, 그다음 최근에 고친 노트 순서
         return [...files]
           .sort((a, b) => (openRank.get(b.path) ?? -1) - (openRank.get(a.path) ?? -1) || (vaultMtime.get(b.path) ?? 0) - (vaultMtime.get(a.path) ?? 0))
           .slice(0, 50)
-          .map((f) => ({ label: f.path.replace(/\.md$/i, ''), data: f.path }));
+          .map((f) => ({ label: displayPath(f.path), data: f.path }));
       }
       const out: (PickerItem<string> & { score: number })[] = [];
       for (const f of files) {
-        const label = f.path.replace(/\.md$/i, '');
+        const label = displayPath(f.path);
         const m = fuzzyMatch(q, label);
         if (m) out.push({ label, matches: m.matches, data: f.path, score: m.score });
       }
@@ -1119,7 +1342,12 @@ async function quickOpen() {
     },
     onPick: (item, q, shift) => {
       if (item && !shift) return void openVaultNote(item.data);
-      if (q.trim()) void followLink(q.trim());
+      const typed = q.trim();
+      if (!typed) return;
+      // 이름 끝에 md가 아닌 확장자를 적으면 그 형식 파일을 그대로 만든다. 그 밖에는 [[링크]]처럼 .md 노트를 만든다
+      const { ext } = splitKnownExtension(typed);
+      if (ext && ext !== 'md') return void createOrOpen(typed, formatContent(ext, titleOf(typed)), '새 파일을');
+      void followLink(typed);
     },
   });
 }
@@ -1134,9 +1362,9 @@ async function searchNotes(initial = '') {
     search: (q) => {
       const items: PickerItem<{ path: string; line?: number }>[] = [];
       for (const hit of searchVault(getIndex(), q)) {
-        if (hit.lines.length === 0) items.push({ label: noteName(hit.path), sub: hit.path, data: { path: hit.path } });
+        if (hit.lines.length === 0) items.push({ label: displayName(hit.path), sub: hit.path, data: { path: hit.path } });
         for (const l of hit.lines.slice(0, 5)) {
-          items.push({ label: l.text || noteName(hit.path), sub: `${hit.path} · ${l.line + 1}줄`, data: { path: hit.path, line: l.line } });
+          items.push({ label: l.text || displayName(hit.path), sub: `${hit.path} · ${l.line + 1}줄`, data: { path: hit.path, line: l.line } });
         }
         if (items.length >= 300) break;
       }
@@ -1243,7 +1471,7 @@ async function openGraph() {
   if (!graphFocus) ($('graph-local') as HTMLInputElement).checked = false;
   graphOn = true;
   $('editor-host').hidden = true;
-  $('preview').hidden = true;
+  sidePane.setVisible(false);
   $('graph-host').hidden = false;
   renderGraph();
 }
@@ -1254,7 +1482,7 @@ function closeGraph() {
   graphView.stop();
   $('graph-host').hidden = true;
   $('editor-host').hidden = false;
-  $('preview').hidden = !previewOn;
+  sidePane.setVisible(previewOn && !compare);
   editor.focus();
 }
 
@@ -1295,6 +1523,61 @@ window.addEventListener('keydown', (e) => {
   closeCompare();
   closeGraph();
 });
+
+// ───────── 클라우드 동기화 반영 (데스크톱 전용) ─────────
+
+function showCloudStatus(s: CloudStatus) {
+  const el = $('status-cloud');
+  const v = cloudStatusBar(s);
+  el.hidden = v.hidden;
+  el.textContent = v.text;
+  el.title = v.title;
+  el.classList.toggle('error', s.state === 'error');
+}
+
+/** 저장하지 않은 변경이 없는 탭을 디스크 내용으로 바꾼다. 커서와 스크롤은 되도록 그대로 둔다 */
+async function reloadTab(tab: Tab) {
+  const text = await api.readFile(tab.path!).catch(() => null);
+  if (text === null || isDirty(tab) || !tabs.includes(tab)) return;
+  tab.diskHash = contentHash(text);
+  if (text !== tab.model.getValue()) {
+    // setValue는 실행 취소 기록을 비운다. 받은 내용을 ⌘Z로 되돌려 다른 기기의 변경을 모르고 덮는 일을 막는다
+    const view = editor.getModel() === tab.model ? editor.saveViewState() : null;
+    tab.model.setValue(text);
+    if (view) editor.restoreViewState(view);
+  }
+  tab.savedVersionId = tab.model.getAlternativeVersionId();
+}
+
+async function applyCloudChanges(paths: string[]) {
+  const { reload, keep } = splitChangedTabs(tabs.map((t) => ({ id: t.id, path: t.path, dirty: isDirty(t) })), paths);
+  for (const id of reload) {
+    const tab = tabs.find((t) => t.id === id);
+    if (tab) await reloadTab(tab);
+  }
+  renderTabs();
+  if (notesDir) {
+    await loadNoteKeys();
+    renderCalendar();
+    await refreshVault();
+  }
+  const kept = tabs.filter((t) => keep.includes(t.id));
+  if (kept.length) status(`${kept.map((t) => `‘${t.title}’`).join(', ')}이 다른 곳에서 바뀌었습니다. 저장할 때 확인합니다.`);
+}
+
+function onCloudEvent(ev: CloudEvent) {
+  if (ev.type === 'status') return showCloudStatus(ev.status);
+  if (ev.type === 'changed') return void applyCloudChanges(ev.paths).catch((e: unknown) => {
+    status(`클라우드에서 받은 변경을 반영하지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
+  });
+  status(`두 곳에서 고친 ‘${baseName(ev.path)}’을 둘 다 남겼습니다 → ‘${baseName(ev.copyPath)}’`);
+}
+
+if (api.cloudAvailable) {
+  api.onCloudEvent(onCloudEvent);
+  $('status-cloud').onclick = () => void openStorageModal();
+  void api.getCloudSettings().then((s) => showCloudStatus(s.status));
+}
 
 // ───────── 명령 처리 ─────────
 
@@ -1352,6 +1635,7 @@ async function run(command: string) {
     case 'notes:toggle-task': return compare ? undefined : toggleTasks();
     case 'notes:choose-dir': return changeNotesDir();
     case 'notes:folders': return changeFolders();
+    case 'notes:storage': return openStorageModal();
     case 'notes:quick-open': return quickOpen();
     case 'notes:search': return searchNotes();
     case 'notes:graph': return graphOn ? closeGraph() : openGraph();
@@ -1359,6 +1643,8 @@ async function run(command: string) {
     case 'view:toggle-sidebar': return toggleSidebar();
     case 'view:toggle-preview': return togglePreview();
     case 'app:keybindings': return editKeybindings();
+    case 'notes:ai-chat': return toggleAiChat();
+    case 'notes:ai-settings': return openAiSettingsModal();
     case 'tools:json-format': return transform('json 정리', (s) => formatJson(s));
     case 'tools:json-minify': return transform('json 압축', minifyJson);
     case 'tools:xml-format': return transform('xml 정리', (s) => formatXml(s));

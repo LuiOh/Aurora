@@ -1,5 +1,6 @@
 // 노트 폴더(vault)의 [[링크]]·태그·할 일을 파싱하고 백링크, 퍼지 검색, 노트 검색을 계산하는 순수 함수 모음
 import { isAttachmentTarget } from './attachments';
+import { isMarkdownPath } from '../../electron/fileTypes';
 
 export interface VaultFile {
   /** 노트 폴더 기준 상대 경로. 구분자는 / */
@@ -132,7 +133,11 @@ export function parseNote(content: string): ParsedNote {
 const dirOf = (p: string) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
 const fileName = (p: string) => p.slice(p.lastIndexOf('/') + 1);
 /** 확장자를 뺀 노트 이름 */
-export const noteName = (p: string) => fileName(p).replace(/\.md$/i, '');
+export const noteName = (p: string) => fileName(p).replace(/\.(md|markdown)$/i, '');
+/** 목록에 보일 이름. 마크다운은 확장자를 빼고, 다른 파일은 확장자까지 보인다 (회의.txt) */
+export const displayName = (p: string) => (isMarkdownPath(p) ? noteName(p) : fileName(p));
+/** 빠르게 열기에 보일 경로. 마크다운만 확장자를 뺀다 */
+export const displayPath = (p: string) => (isMarkdownPath(p) ? p.replace(/\.(md|markdown)$/i, '') : p);
 
 /** 파일 이름(소문자) → 그 이름을 가진 파일 경로들 */
 /** 노트를 폴더별로 묶는다. 폴더는 맨 위(빈 이름)부터 이름순, 노트도 이름순이다. skip 폴더와 그 아래는 뺀다 */
@@ -146,7 +151,7 @@ export function notesByFolder(paths: string[], skip: string[] = []): { folder: s
   const byName = (a: string, b: string) => a.localeCompare(b, 'ko');
   return [...groups.keys()].sort(byName).map((folder) => ({
     folder,
-    notes: groups.get(folder)!.sort((a, b) => byName(noteName(a), noteName(b))),
+    notes: groups.get(folder)!.sort((a, b) => byName(displayName(a), displayName(b))),
   }));
 }
 
@@ -207,19 +212,23 @@ export function resolveLink(target: string, sourcePath: string, lookup: NameLook
 // ───────── 색인 ─────────
 
 export interface VaultIndex {
+  /** 마크다운 노트만. 링크·백링크·태그·할 일·그래프는 이것만 본다 */
   files: VaultFile[];
+  /** 텍스트 파일까지 모두. 노트 목록·빠르게 열기·전체 검색에 쓴다 */
+  allFiles: VaultFile[];
   notes: Map<string, ParsedNote>;
   lookup: NameLookup;
   /** 노트별로 해석한 링크 대상 (못 찾은 링크는 null) */
   resolved: Map<string, (string | null)[]>;
 }
 
-export function buildIndex(files: VaultFile[]): VaultIndex {
+export function buildIndex(allFiles: VaultFile[]): VaultIndex {
+  const files = allFiles.filter((f) => isMarkdownPath(f.path));
   const notes = new Map(files.map((f) => [f.path, parseNote(f.content)]));
   const lookup = buildLookup(files.map((f) => f.path));
   const resolved = new Map<string, (string | null)[]>();
   for (const [path, note] of notes) resolved.set(path, note.links.map((l) => resolveLink(l.target, path, lookup)));
-  return { files, notes, lookup, resolved };
+  return { files, allFiles, notes, lookup, resolved };
 }
 
 export interface Mention {
@@ -414,14 +423,19 @@ export function parseQuery(query: string): Term[] {
   return terms;
 }
 
+const EMPTY_NOTE: ParsedNote = { links: [], tags: [], tasks: [], headings: [] };
+
 const textHas = (text: string, t: Term) => (t.regex ? t.regex.test(text) : text.toLowerCase().includes(t.value));
 
 export function searchVault(index: VaultIndex, query: string): SearchHit[] {
   const terms = parseQuery(query);
   if (terms.length === 0) return [];
   const hits: SearchHit[] = [];
-  for (const f of index.files) {
-    const note = index.notes.get(f.path)!;
+  for (const f of index.allFiles) {
+    // 마크다운이 아닌 파일은 태그·할 일이 없으므로 tag:·task: 조건이 있으면 (제외 조건이라도) 결과에서 뺀다
+    const parsed = index.notes.get(f.path);
+    if (!parsed && terms.some((t) => t.op === 'tag' || t.op.startsWith('task'))) continue;
+    const note = parsed ?? EMPTY_NOTE;
     const lines = f.content.split('\n');
     const matched = new Map<number, string>();
     let ok = true;

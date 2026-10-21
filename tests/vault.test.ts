@@ -1,7 +1,7 @@
 // 노트 폴더의 링크 파싱·해석, 백링크, 태그, 할 일, 퍼지 검색, 노트 검색, 그래프 로직을 검사하는 단위 테스트
 import { describe, expect, it } from 'vitest';
 import {
-  allTasks, backlinks, buildGraph, buildIndex, buildLookup, fuzzyMatch, notesByFolder, parseNote, parseQuery,
+  allTasks, backlinks, buildGraph, buildIndex, buildLookup, displayName, displayPath, fuzzyMatch, notesByFolder, parseNote, parseQuery,
   resolveLink, searchVault, splitLinkText, tagCounts, unlinkedMentions, unresolvedLinks,
 } from '../src/lib/vault';
 
@@ -167,5 +167,40 @@ describe('첨부 링크', () => {
     const index = buildIndex([{ path: '노트.md', content: '![[첨부/a.png]] [[없는 노트]]' }]);
     expect([...unresolvedLinks(index).keys()]).toEqual(['없는 노트']);
     expect(buildGraph(index, { tags: false, unresolved: true }).nodes.map((n) => n.label)).toEqual(['노트', '없는 노트']);
+  });
+});
+
+describe('마크다운이 아닌 텍스트 파일', () => {
+  const index = buildIndex([
+    { path: '노트.md', content: '[[a.txt]] [[회의]] #업무\n- [ ] 할 일 배포' },
+    { path: '회의.md', content: '회의 내용' },
+    { path: 'a.txt', content: '[[노트]] 배포 메모\n- [ ] 텍스트 할 일' },
+    { path: 'style.css', content: '.x { color: #fff; } 노트' },
+  ]);
+  it('링크·백링크·태그·할 일·그래프는 마크다운만 본다', () => {
+    expect(index.files.map((f) => f.path)).toEqual(['노트.md', '회의.md']);
+    expect(index.allFiles).toHaveLength(4);
+    expect(index.resolved.get('노트.md')).toEqual([null, '회의.md']);
+    expect(index.notes.has('a.txt')).toBe(false);
+    expect(backlinks(index, '노트.md')).toEqual([]);
+    expect(unlinkedMentions(index, '노트.md')).toEqual([]);
+    expect(tagCounts(index).map((t) => t.tag)).toEqual(['업무']);
+    expect(allTasks(index).map((t) => t.path)).toEqual(['노트.md']);
+    expect(buildGraph(index, { tags: true, unresolved: true }).nodes.map((n) => n.id)).not.toContain('a.txt');
+  });
+  it('전체 검색은 모든 파일의 본문·file:·path:를 찾고 tag:·task:는 마크다운만 찾는다', () => {
+    expect(searchVault(index, '배포').map((h) => h.path).sort()).toEqual(['a.txt', '노트.md']);
+    expect(searchVault(index, 'file:style').map((h) => h.path)).toEqual(['style.css']);
+    expect(searchVault(index, 'path:.txt').map((h) => h.path)).toEqual(['a.txt']);
+    expect(searchVault(index, 'task:할').map((h) => h.path)).toEqual(['노트.md']);
+    expect(searchVault(index, 'tag:fff')).toEqual([]);
+    expect(searchVault(index, '-tag:업무').map((h) => h.path)).toEqual(['회의.md']);
+  });
+  it('목록에는 마크다운이 아닌 파일도 확장자와 함께 보인다', () => {
+    expect(notesByFolder(index.allFiles.map((f) => f.path))[0].notes).toEqual(['노트.md', '회의.md', 'a.txt', 'style.css']);
+    expect(displayName('폴더/회의.txt')).toBe('회의.txt');
+    expect(displayName('폴더/회의.md')).toBe('회의');
+    expect(displayPath('폴더/회의.md')).toBe('폴더/회의');
+    expect(displayPath('폴더/회의.txt')).toBe('폴더/회의.txt');
   });
 });

@@ -1,10 +1,11 @@
 // 브라우저 폴더 접근 기능(File System Access API)의 폴더 핸들로 노트 파일을 읽고 쓰는 함수 모음 (웹 버전용)
+import { isSkippedEntry, isTextPath, shouldKeepContent, shouldReadFile } from '../../electron/fileTypes';
 
 /** 테스트에서 가짜로 바꿀 수 있게 필요한 부분만 적은 핸들 타입 */
 export interface FileHandleLike {
   kind: 'file';
   name: string;
-  getFile(): Promise<{ text(): Promise<string>; lastModified: number }>;
+  getFile(): Promise<{ text(): Promise<string>; lastModified: number; size: number }>;
   createWritable(): Promise<{ write(data: string | Uint8Array<ArrayBuffer>): Promise<void>; close(): Promise<void> }>;
 }
 
@@ -51,16 +52,19 @@ export async function writeText(root: DirHandleLike, rel: string, content: strin
   await w.close();
 }
 
-/** 모든 .md 파일. 데스크톱 앱과 같이 .으로 시작하는 폴더와 node_modules는 건너뛴다 */
+/** 모든 .md 파일과 txt·html 같은 텍스트 파일. 데스크톱 앱과 같이 .으로 시작하는 폴더와 node_modules는 건너뛴다 */
 export async function scanMarkdown(root: DirHandleLike): Promise<{ path: string; mtime: number; content: string }[]> {
   const out: { path: string; mtime: number; content: string }[] = [];
   const walk = async (dir: DirHandleLike, prefix: string) => {
     for await (const ent of dir.values()) {
-      if (ent.name.startsWith('.') || ent.name === 'node_modules') continue;
+      if (isSkippedEntry(ent.name)) continue;
       if (ent.kind === 'directory') await walk(ent, `${prefix}${ent.name}/`);
-      else if (ent.name.toLowerCase().endsWith('.md')) {
+      else if (isTextPath(ent.name)) {
         const file = await ent.getFile();
-        out.push({ path: `${prefix}${ent.name}`, mtime: file.lastModified, content: await file.text() });
+        if (!shouldReadFile(ent.name, file.size)) continue;
+        const content = await file.text();
+        if (!shouldKeepContent(ent.name, content)) continue;
+        out.push({ path: `${prefix}${ent.name}`, mtime: file.lastModified, content });
       }
     }
   };

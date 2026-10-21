@@ -33,8 +33,18 @@ export function isAttachmentTarget(target: string): boolean {
 export function pastedImageName(d: Date, mime: string): string {
   const p = (n: number) => String(n).padStart(2, '0');
   const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-  const ext = { 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' }[mime] ?? 'png';
-  return `Pasted image ${stamp}.${ext}`;
+  return `Pasted image ${stamp}.${imageExt(mime)}`;
+}
+
+/** 이미지 MIME 형식에 맞는 확장자. 모르는 형식은 png로 본다 */
+export function imageExt(mime: string): string {
+  return { 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' }[mime.toLowerCase()] ?? 'png';
+}
+
+/** AI가 만든 그림에 붙일 이름. "AI 이미지 2026-10-21 0834.png" 형식 */
+export function aiImageName(d: Date, mime: string): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `AI 이미지 ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}${p(d.getMinutes())}.${imageExt(mime)}`;
 }
 
 /** taken에 이미 있는 이름이면 "이름 1.확장자", "이름 2.확장자"처럼 비는 이름을 고른다 */
