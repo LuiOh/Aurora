@@ -8,10 +8,10 @@
 
 [Releases](https://github.com/LuiOh/Aurora/releases)에서 내려받습니다.
 
-- **맥 (Apple Silicon)**: `Aurora-0.1.0-arm64.dmg`를 열어 Aurora를 응용 프로그램 폴더로 끌어다 놓습니다.
-- **윈도우**: `Aurora.Setup.0.1.0.exe`로 설치하거나, 설치 없이 쓰려면 `Aurora-0.1.0-win.zip`(ARM PC는 `arm64-win.zip`)을 풀어 실행합니다.
+- **맥 (Apple Silicon)**: `Aurora-0.1.0-arm64.pkg`를 열어 설치합니다. Aurora가 응용 프로그램 폴더에 들어갑니다.
+- **윈도우**: `Aurora.Setup.0.1.0.exe`로 설치합니다.
 
-코드 서명을 하지 않은 빌드라 처음 한 번은 경고가 뜹니다. 맥은 응용 프로그램 폴더에서 Aurora를 오른쪽 클릭해 "열기"를 누릅니다. 그래도 열리지 않으면 터미널에서 `xattr -dr com.apple.quarantine /Applications/Aurora.app`을 실행합니다. 윈도우는 SmartScreen 경고에서 "추가 정보"를 누르고 "실행"을 누릅니다.
+코드 서명을 하지 않은 빌드라 처음 한 번은 경고가 뜹니다. 맥은 설치 파일을 처음 열 때 막히면 시스템 설정 > 개인정보 보호 및 보안에서 "그래도 열기"를 누릅니다(macOS 14 이하는 설치 파일을 오른쪽 클릭해 "열기"). 설치 프로그램이 앱의 격리 표시를 지우므로 설치한 Aurora는 경고 없이 열립니다. 윈도우는 SmartScreen 경고에서 "추가 정보"를 누르고 "실행"을 누릅니다.
 
 ## 빠른 시작
 
@@ -143,9 +143,10 @@ Node 20.19 이상이 필요합니다.
 1. `npm install`로 의존성을 설치합니다. electron 바이너리가 받아지지 않았으면 `node node_modules/electron/install.js`를 한 번 실행합니다.
 2. `npm run dev`로 개발 모드를 띄우고, `npm test`로 단위 테스트를 돌립니다.
 3. `npm run build`로 타입 검사와 빌드를 합니다.
-4. `npm run dist`로 맥 앱과 dmg를, `npm run dist:win`으로 윈도우 설치 파일과 zip을 `release/`에 만듭니다. 윈도우 빌드는 맥에서도 만들 수 있습니다.
+4. `npm run dist`로 맥 앱과 설치 파일(pkg)을, `npm run dist:win`으로 윈도우 설치 파일(exe)을 `release/`에 만듭니다. 윈도우 빌드는 맥에서도 만들 수 있습니다.
 5. `npm run dev:web`으로 웹 버전을 띄우고, `npm run build:web`으로 `dist/`에 올릴 파일을 만듭니다.
 6. 아이콘은 `build/icon.svg`를 고친 뒤 `scripts/icons.sh`로 맥·윈도우·웹 아이콘을 다시 만듭니다.
+7. 키체인에 "Developer ID Application" 인증서가 있으면 `npm run dist`가 맥 앱에 서명합니다. 프로젝트 맨 위의 `electron-builder.env`에 `APPLE_API_KEY`(.p8 파일 경로), `APPLE_API_KEY_ID`, `APPLE_API_ISSUER`를 적어 두면 공증까지 합니다. 인증서가 없으면 서명하지 않고 만듭니다. `electron-builder.env`는 git에 올리지 않습니다.
 
 구조는 다음과 같습니다.
 

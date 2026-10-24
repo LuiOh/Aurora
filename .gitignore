@@ -4,3 +4,4 @@ dist-electron
 release
 out
 .DS_Store
+electron-builder.env

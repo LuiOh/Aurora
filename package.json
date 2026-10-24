@@ -36,20 +36,18 @@
     ],
     "mac": {
       "target": [
-        "dmg",
+        "pkg",
         "dir"
       ],
-      "category": "public.app-category.developer-tools",
-      "identity": null
+      "category": "public.app-category.developer-tools"
+    },
+    "pkg": {
+      "isRelocatable": false
     },
     "win": {
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64", "arm64"]
-        },
-        {
-          "target": "zip",
           "arch": ["x64", "arm64"]
         }
       ]
